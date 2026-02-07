@@ -1,0 +1,11 @@
+! Opt LooseOpt   B3LYP def2-SVP RIJCOSX def2/J TightSCF miniprint pal4
+%geom Constraints
+        FIXED_ATOM_LINES
+        end
+      end
+
+* xyz CHAR MULT
+XYZ_LINES
+*
+ 
+

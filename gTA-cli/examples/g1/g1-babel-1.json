@@ -1,0 +1,12 @@
+{
+  "input_sdf": "g1-babel.sdf",
+  "index_start_from": 1,
+  "transformations": [
+    {
+        "alias": "arm_1",
+        "anchor_atom": 1,
+        "arm_atoms": [2, 5],
+        "angle": [20]
+    }
+  ]
+}

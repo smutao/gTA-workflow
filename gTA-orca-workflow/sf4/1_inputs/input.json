@@ -1,0 +1,13 @@
+{
+  "input_xyz": "orcaopt.xyz",
+  "first_coord_sphere_only": true,
+  "index_start_from": 1,
+  "transformations": [
+    {
+        "alias": "arm_1",
+        "anchor_atom": 1,
+        "arm_atoms": [2, 4, 5],
+        "angle": [5]
+    }
+  ]
+}
