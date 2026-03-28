@@ -1,0 +1,14 @@
+! Opt LooseOpt   B3LYP def2-SVP RIJCOSX def2/J TightSCF miniprint 
+%geom Constraints
+        FIXED_ATOM_LINES
+        end
+      end
+%geom
+    MaxIter GEOM_MAX_CYCLE  # max cycles for geometry optimization, useful for large systems to save time
+end
+
+* xyz CHAR MULT
+XYZ_LINES
+*
+ 
+

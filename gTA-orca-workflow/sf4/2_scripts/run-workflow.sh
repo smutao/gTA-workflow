@@ -1,136 +1,386 @@
 #!/bin/bash
 
 # ==============================================================================
-#  分子结构迭代优化工作流脚本（ORCA 版）
-#
-#  说明：按 orca_dev_plan.md 将原 xTB 步骤替换为 ORCA 固定原子优化。
-#  - gTA 与整体迭代逻辑保持不变
-#  - gTA 的输入结构文件名改为 orcaopt.xyz
-#  - ORCA 输入由模板生成，固定原子由 bash 数组提供（1 起始），转换为 0 起始
-#  - 每轮 ORCA 产物保存至 orca_sav 并加 I%03d_ 前缀
+#  Molecular Structure Iterative Optimization Workflow (ORCA)
+#  Features:
+#  - gTA rotation + ORCA constrained geometry optimization iterations
+#  - Initial-geometry single-point energy (iteration 0)
+#  - Record absolute/relative energies to energy_log.csv
+#  - Append trajectory to scan-traj.xyz (initial geometry + each IXXX_FixedOpt.xyz)
 # ==============================================================================
 
-# --- 配置 ---
-# 如果脚本出错则立即退出
 set -e
-# 在管道命令中，任何一步出错都算作出错
 set -o pipefail
 
+usage() {
+  cat <<'EOF'
+Usage:
+  run-workflow.sh [-m max_iter] [-a angle] [-c anchor_atom] [-r arm_atomids] \
+                  [-q charge] [-u mult] [-f opt_fix_atomids] [-i initial_geom] [-n max_cycle] [-k orca_cmd]
 
-# ==============================================================================
-# --- 用户配置区 ---
-# 请在此处设置迭代次数和所有文件的路径。
-# 脚本设计为自动定位，如果您的目录结构与推荐结构一致，则无需修改。
-# ==============================================================================
+Options:
+  -m  Number of iterations, mapped to MAX_ITERATIONS
+  -a  gTA rotation angle (integer, can be negative, e.g. '-5' or '10'), mapped to angle:[GTA_ANGLE]
+  -c  gTA central atom id, mapped to anchor_atom:[GTA_ANCHOR_ATOM]
+  -r  gTA arm atom ids, supports "1,2-4,7", mapped to arm_atoms:[GTA_ARM_ATOMS]
+  -q  Molecular charge CHARGE
+  -u  Molecular spin multiplicity MULT
+  -f  Fixed atom ids for optimization, supports "1,2-4,7-9" expansion to (1 2 3 4 7 8 9)
+  -i  Initial geometry file path, mapped to INITIAL_XYZ_FILE
+  -n  ORCA geometry optimization MaxIter (integer). If set, use maxcycle template and replace GEOM_MAX_CYCLE
+  -k  Override ORCA execution command (full command string, e.g. "singularity exec ... orca")
+  -h  Show help
+EOF
+}
 
-## 迭代与分子整体参数
-MAX_ITERATIONS=24
-CHARGE=0            # 分子电荷
-MULT=1              # 总自旋多重度（替代 UNPAIR）
+expand_atom_id_list() {
+  local spec="$1"
+  local -a out=()
+  local -a parts=()
 
-## 固定原子列表（1 起始索引；可按需修改）
-FIXED_ATOMS_1BASED=(2 3 4 5)
+  spec="${spec// /}"
+  if [ -z "$spec" ]; then
+    echo ""
+    return 0
+  fi
 
+  IFS=',' read -r -a parts <<< "$spec"
+  for part in "${parts[@]}"; do
+    if [[ "$part" =~ ^[0-9]+$ ]]; then
+      if [ "$part" -lt 1 ]; then
+        echo "Error: atom id must be >= 1: $part" >&2
+        return 1
+      fi
+      out+=("$part")
+    elif [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      local start="${BASH_REMATCH[1]}"
+      local end="${BASH_REMATCH[2]}"
+      local i
+      if [ "$start" -lt 1 ] || [ "$end" -lt 1 ]; then
+        echo "Error: atom id must be >= 1: $part" >&2
+        return 1
+      fi
+      if [ "$start" -gt "$end" ]; then
+        echo "Error: range start is greater than range end: $part" >&2
+        return 1
+      fi
+      for ((i=start; i<=end; i++)); do
+        out+=("$i")
+      done
+    else
+      echo "Error: cannot parse atom id list: $part" >&2
+      return 1
+    fi
+  done
 
-# 获取脚本所在的目录，从而推断出项目根目录（可从任意位置运行）
+  echo "${out[*]}"
+}
+
+join_by_comma_space() {
+  local first=1
+  local out=""
+  local x
+  for x in "$@"; do
+    if [ "$first" -eq 1 ]; then
+      out="$x"
+      first=0
+    else
+      out="$out, $x"
+    fi
+  done
+  echo "$out"
+}
+
+# Resolve script directory and project root
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
 
-
-# --- 文件路径配置 ---
+# ---------------- Default parameters ----------------
+MAX_ITERATIONS=24
+CHARGE=0
+MULT=1
 INITIAL_XYZ_FILE="$PROJECT_ROOT/1_inputs/opted_sf4.xyz"
+FIXED_ATOMS_1BASED=(2 3 4 5)
+
+GTA_ANGLE="5"
+GTA_ANCHOR_ATOM=1
+GTA_ARM_ATOMS_SPEC="2,4,5"
+FIXED_ATOMS_SPEC=""
+MAX_CYCLE=""
+
+# ---------------- Path configuration ----------------
 GTA_SCRIPT_FILE="$PROJECT_ROOT/2_scripts/gTA-cli.py"
-GTA_JSON_FILE="$PROJECT_ROOT/1_inputs/input.json"
+GTA_JSON_TEMPLATE="$PROJECT_ROOT/1_inputs/gta-cli_input-template.json"
+SP_TEMPLATE="$PROJECT_ROOT/0_orca_templates/orca-sp-energy-template.txt"
+ORCA_TEMPLATE_NOMAX="$PROJECT_ROOT/0_orca_templates/orca-fixed-opt-template_nomaxcycle.txt"
+ORCA_TEMPLATE_MAX="$PROJECT_ROOT/0_orca_templates/orca-fixed-opt-template_maxcycle.txt"
+ORCA_OPT_TEMPLATE="$ORCA_TEMPLATE_NOMAX"
 WORKSPACE_DIR="$PROJECT_ROOT/4_workspace"
-ORCA_PATH="/home/raymond/packages-installed/orca-610/orca"
+ORCA_PATH="singularity exec  -B /mnt/hdd_1t:/mnt/hdd_1t /home/raymond/storage-hdd-1tb/apptainer-images/orca.sif  orca"
 
-# gTA 旋转产物命名（与 input.json 内 alias/angle 对应）
-TARGET_GTA_OUTPUT_SUFFIX="arm_1_5deg"
+# ---------------- Argument parsing ----------------
+while getopts ":m:a:c:r:q:u:f:i:n:k:h" opt; do
+  case "$opt" in
+    m)
+      MAX_ITERATIONS="$OPTARG"
+      ;;
+    a)
+      GTA_ANGLE="$OPTARG"
+      ;;
+    c)
+      GTA_ANCHOR_ATOM="$OPTARG"
+      ;;
+    r)
+      GTA_ARM_ATOMS_SPEC="$OPTARG"
+      ;;
+    q)
+      CHARGE="$OPTARG"
+      ;;
+    u)
+      MULT="$OPTARG"
+      ;;
+    f)
+      FIXED_ATOMS_SPEC="$OPTARG"
+      ;;
+    i)
+      INITIAL_XYZ_FILE="$OPTARG"
+      ;;
+    n)
+      MAX_CYCLE="$OPTARG"
+      ;;
+    k)
+      ORCA_PATH="$OPTARG"
+      ;;
+    h)
+      usage
+      exit 0
+      ;;
+    :)
+      echo "Error: option -$OPTARG requires an argument" >&2
+      usage
+      exit 1
+      ;;
+    \?)
+      echo "Error: unknown option -$OPTARG" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
 
+# ---------------- Argument validation ----------------
+if [[ ! "$MAX_ITERATIONS" =~ ^[0-9]+$ ]] || [ "$MAX_ITERATIONS" -lt 1 ]; then
+  echo "Error: -m must be a positive integer" >&2
+  exit 1
+fi
 
-# ==============================================================================
-# --- 工作流开始 (无需修改以下部分) ---
-# ==============================================================================
+if [[ ! "$GTA_ANGLE" =~ ^-?[0-9]+$ ]]; then
+  echo "Error: -a must be an integer (can be negative)" >&2
+  exit 1
+fi
+
+if [[ ! "$GTA_ANCHOR_ATOM" =~ ^[0-9]+$ ]] || [ "$GTA_ANCHOR_ATOM" -lt 1 ]; then
+  echo "Error: -c must be a positive integer" >&2
+  exit 1
+fi
+
+if [[ ! "$CHARGE" =~ ^-?[0-9]+$ ]]; then
+  echo "Error: -q must be an integer" >&2
+  exit 1
+fi
+
+if [[ ! "$MULT" =~ ^[0-9]+$ ]] || [ "$MULT" -lt 1 ]; then
+  echo "Error: -u must be a positive integer" >&2
+  exit 1
+fi
+
+if [ -z "$ORCA_PATH" ]; then
+  echo "Error: ORCA command from -k cannot be empty" >&2
+  exit 1
+fi
+
+if [ -n "$MAX_CYCLE" ]; then
+  if [[ ! "$MAX_CYCLE" =~ ^[0-9]+$ ]] || [ "$MAX_CYCLE" -lt 1 ]; then
+    echo "Error: -n must be a positive integer" >&2
+    exit 1
+  fi
+  ORCA_OPT_TEMPLATE="$ORCA_TEMPLATE_MAX"
+else
+  ORCA_OPT_TEMPLATE="$ORCA_TEMPLATE_NOMAX"
+fi
+
+# Normalize initial geometry path (if relative, resolve against current invocation directory)
+if [[ "$INITIAL_XYZ_FILE" != /* ]]; then
+  INITIAL_XYZ_FILE="$PWD/$INITIAL_XYZ_FILE"
+fi
+
+# Parse arm atom ids
+ARM_IDS_EXPANDED=$(expand_atom_id_list "$GTA_ARM_ATOMS_SPEC") || exit 1
+if [ -z "$ARM_IDS_EXPANDED" ]; then
+  echo "Error: parsed result of -r is empty" >&2
+  exit 1
+fi
+read -r -a GTA_ARM_ATOMS_ARRAY <<< "$ARM_IDS_EXPANDED"
+GTA_ARM_ATOMS_JSON=$(join_by_comma_space "${GTA_ARM_ATOMS_ARRAY[@]}")
+
+# Parse fixed atom ids
+if [ -n "$FIXED_ATOMS_SPEC" ]; then
+  FIXED_IDS_EXPANDED=$(expand_atom_id_list "$FIXED_ATOMS_SPEC") || exit 1
+  if [ -z "$FIXED_IDS_EXPANDED" ]; then
+    echo "Error: parsed result of -f is empty" >&2
+    exit 1
+  fi
+  read -r -a FIXED_ATOMS_1BASED <<< "$FIXED_IDS_EXPANDED"
+fi
 
 echo "================================================="
-echo "===   分子结构迭代优化工作流启动 (ORCA 版)   ==="
+echo "===   Molecular Iterative Optimization Workflow (ORCA)   ==="
 echo "================================================="
+echo "Parameter summary:"
+echo "  MAX_ITERATIONS = $MAX_ITERATIONS"
+echo "  CHARGE/MULT    = $CHARGE / $MULT"
+echo "  INITIAL_XYZ    = $INITIAL_XYZ_FILE"
+echo "  GTA angle      = $GTA_ANGLE"
+echo "  GTA anchor     = $GTA_ANCHOR_ATOM"
+echo "  GTA arm atoms  = [$GTA_ARM_ATOMS_JSON]"
+echo "  FIXED atoms    = (${FIXED_ATOMS_1BASED[*]})"
+echo "  ORCA command   = $ORCA_PATH"
+if [ -n "$MAX_CYCLE" ]; then
+  echo "  ORCA template  = maxcycle (MaxIter=$MAX_CYCLE)"
+else
+  echo "  ORCA template  = nomaxcycle"
+fi
 echo
 
-# --- 1. 初始化 ---
-echo "--- 步骤 1: 环境初始化 ---"
+# ---------------- 1. Initialization ----------------
+echo "--- Step 1: Environment initialization ---"
 
-# 创建并进入工作目录，后续所有操作都在此进行
-mkdir -p "$WORKSPACE_DIR"
-cd "$WORKSPACE_DIR"
-echo "工作目录已设置为: $WORKSPACE_DIR"
-
-# 检查所有输入文件是否存在
-for f in "$INITIAL_XYZ_FILE" "$GTA_SCRIPT_FILE" "$GTA_JSON_FILE"; do
+for f in "$INITIAL_XYZ_FILE" "$GTA_SCRIPT_FILE" "$GTA_JSON_TEMPLATE" "$SP_TEMPLATE" "$ORCA_OPT_TEMPLATE"; do
   if [ ! -f "$f" ]; then
-    echo "错误: 配置文件或脚本不存在: $f" >&2
+    echo "Error: required file not found: $f" >&2
     exit 1
   fi
 done
-echo "所有输入文件检查完毕。"
+echo "All required input files found."
+
+mkdir -p "$WORKSPACE_DIR"
+cd "$WORKSPACE_DIR"
+echo "Working directory set to: $WORKSPACE_DIR"
 
 mkdir -p orca orca_sav
 
-# 准备能量日志文件
 ENERGY_LOG="energy_log.csv"
-echo "Iteration,Energy(Eh)" > "$ENERGY_LOG"
-echo "已创建能量日志文件: $ENERGY_LOG"
+REL_FACTOR=627.509
+echo "Iteration,Energy(Eh),Relative Energy (kcal/mol)" > "$ENERGY_LOG"
+echo "Created energy log file: $ENERGY_LOG"
 
-# 复制初始XYZ文件作为第一次循环的输入（ORCA 版为 orcaopt.xyz）
+SCAN_TRAJ="scan-traj.xyz"
+
 cp "$INITIAL_XYZ_FILE" ./orcaopt.xyz
-echo "已复制初始结构到 ./orcaopt.xyz"
+echo "Copied initial geometry to ./orcaopt.xyz"
 
-# 将 gTA 的配置文件复制到当前工作目录，并将 input_xyz 改为 orcaopt.xyz
-cp "$GTA_JSON_FILE" ./input.json
-# python3 - "$PWD/input.json" <<'PY'
-# import json,sys
-# p=sys.argv[1]
-# with open(p,'r') as f: cfg=json.load(f)
-# cfg['input_xyz']='orcaopt.xyz'
-# with open(p,'w') as f: json.dump(cfg,f,indent=2)
-# print('已更新 input.json: input_xyz=orcaopt.xyz')
-# PY
-# echo
+cp "$INITIAL_XYZ_FILE" ./starting_geom.xyz
+echo "Saved initial geometry snapshot to: ./starting_geom.xyz"
 
-# --- 2. 主循环 ---
-for i in $(seq 1 $MAX_ITERATIONS); do
-  echo "------------------ 开始第 $i / $MAX_ITERATIONS 次迭代 ------------------"
+cp ./starting_geom.xyz "$SCAN_TRAJ"
+echo "Initialized scan trajectory: $SCAN_TRAJ (frame 1 is the initial geometry)"
 
-  # --- 步骤 A: gTA 旋转 ---
-  echo "[步骤 A] 使用 gTA 旋转结构..."
+# Generate runtime gTA input.json
+sed \
+  -e "s/GTA_ANCHOR_ATOM/$GTA_ANCHOR_ATOM/g" \
+  -e "s/GTA_ARM_ATOMS/$GTA_ARM_ATOMS_JSON/g" \
+  -e "s/GTA_ANGLE/$GTA_ANGLE/g" \
+  "$GTA_JSON_TEMPLATE" > ./input.json
+echo "Generated gTA config: ./input.json"
+
+TARGET_GTA_OUTPUT_SUFFIX=$(
+  python3 - "$PWD/input.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+with open(p, "r") as f:
+    cfg = json.load(f)
+t = cfg["transformations"][0]
+print(f"{t['alias']}_{t['angle'][0]}deg")
+PY
+)
+if [ -z "$TARGET_GTA_OUTPUT_SUFFIX" ]; then
+  echo "Error: cannot derive gTA output suffix from input.json" >&2
+  exit 1
+fi
+echo "gTA output suffix: $TARGET_GTA_OUTPUT_SUFFIX"
+echo
+
+# ---------------- 1.5 Initial single-point energy ----------------
+echo "--- Step 1.5: Initial-geometry single-point energy ---"
+ORCA_RUN_DIR="orca"
+SP_IN="$ORCA_RUN_DIR/SP0.txt"
+SP_OUT="$ORCA_RUN_DIR/SP0.out.txt"
+
+rm -rf "$ORCA_RUN_DIR"/*
+
+XYZ_LINES=$(tail -n +3 ./starting_geom.xyz)
+{
+  while IFS= read -r line; do
+    if [[ "$line" == *"XYZ_LINES"* ]]; then
+      printf "%s\n" "$XYZ_LINES"
+      continue
+    fi
+    line=${line/CHAR/$CHARGE}
+    line=${line/MULT/$MULT}
+    printf "%s\n" "$line"
+  done < "$SP_TEMPLATE"
+} > "$SP_IN"
+
+( cd "$ORCA_RUN_DIR" && $ORCA_PATH SP0.txt > SP0.out.txt ) || true
+
+if grep -q "TOTAL RUN TIME" "$SP_OUT" 2>/dev/null; then
+  echo "Initial ORCA single-point run finished"
+else
+  echo "Warning: initial ORCA single-point run may be incomplete (TOTAL RUN TIME not found)"
+fi
+
+SP_ENERGY=$(awk '/FINAL SINGLE POINT ENERGY/{e=$NF} END{print e}' "$SP_OUT" 2>/dev/null)
+[ -z "$SP_ENERGY" ] && SP_ENERGY=NA
+if [ "$SP_ENERGY" != "NA" ]; then
+  REF_ENERGY="$SP_ENERGY"
+  SP_REL_ENERGY="0.000000"
+else
+  REF_ENERGY=""
+  SP_REL_ENERGY="NA"
+fi
+echo "0,$SP_ENERGY,$SP_REL_ENERGY" >> "$ENERGY_LOG"
+echo "Iteration 0 (initial geometry) energy: $SP_ENERGY Eh, relative energy: $SP_REL_ENERGY kcal/mol"
+echo
+
+# ---------------- 2. Main loop ----------------
+for i in $(seq 1 "$MAX_ITERATIONS"); do
+  echo "------------------ Starting iteration $i / $MAX_ITERATIONS ------------------"
+
+  # A) gTA rotation
+  echo "[Step A] Rotating geometry with gTA..."
   python3 "$GTA_SCRIPT_FILE" ./input.json
   ROTATED_DIR="orcaopt"
   ROTATED_FILE="${ROTATED_DIR}/orcaopt_${TARGET_GTA_OUTPUT_SUFFIX}.xyz"
   if [ ! -f "$ROTATED_FILE" ]; then
-    echo "错误: gTA 未能生成旋转文件 '$ROTATED_FILE'！" >&2
+    echo "Error: gTA did not generate rotated file '$ROTATED_FILE'" >&2
     exit 1
   fi
-  echo "结构旋转完成: $ROTATED_FILE"
+  echo "Rotation complete: $ROTATED_FILE"
 
-  # --- 步骤 B: ORCA 固定原子优化 ---
-  echo "[步骤 B] 使用 ORCA 进行固定原子优化..."
+  # B) ORCA constrained optimization
+  echo "[Step B] Running ORCA constrained optimization..."
   ORCA_RUN_DIR="orca"
   ORCA_SAVE_DIR="orca_sav"
   mkdir -p "$ORCA_RUN_DIR" "$ORCA_SAVE_DIR"
   rm -rf "$ORCA_RUN_DIR"/*
 
-
-  # 生成 FIXED_ATOM_LINES（1→0 起始）
   FIXED_LINES=$(
-  for a in "${FIXED_ATOMS_1BASED[@]}"; do
-    printf '        {C %d C}\n' "$((a-1))"
-  done
+    for a in "${FIXED_ATOMS_1BASED[@]}"; do
+      printf '        {C %d C}\n' "$((a-1))"
+    done
   )
 
-  # 生成 XYZ_LINES（去掉 xyz 的前两行头）
   XYZ_LINES=$(tail -n +3 "$ROTATED_FILE")
-
-  TEMPLATE="$PROJECT_ROOT/0_orca_templates/orca-fixed-opt-template.txt"
   ORCA_IN="$ORCA_RUN_DIR/FixedOpt.txt"
   {
     while IFS= read -r line; do
@@ -144,20 +394,21 @@ for i in $(seq 1 $MAX_ITERATIONS); do
       fi
       line=${line/CHAR/$CHARGE}
       line=${line/MULT/$MULT}
+      if [ -n "$MAX_CYCLE" ]; then
+        line=${line/GEOM_MAX_CYCLE/$MAX_CYCLE}
+      fi
       printf "%s\n" "$line"
-    done < "$TEMPLATE"
+    done < "$ORCA_OPT_TEMPLATE"
   } > "$ORCA_IN"
 
   ( cd "$ORCA_RUN_DIR" && $ORCA_PATH FixedOpt.txt > FixedOpt.out.txt ) || true
 
-  # 判断是否正常结束（可选）
   if grep -q "TOTAL RUN TIME" "$ORCA_RUN_DIR/FixedOpt.out.txt" 2>/dev/null; then
-    echo "ORCA 正常结束"
+    echo "ORCA finished normally"
   else
-    echo "警告: ORCA 可能未正常结束（未发现 TOTAL RUN TIME）"
+    echo "Warning: ORCA may be incomplete (TOTAL RUN TIME not found)"
   fi
 
-  # 复制产物到保存目录并加前缀
   ITER_TAG=$(printf "I%03d" "$i")
   for f in FixedOpt.txt FixedOpt.out.txt FixedOpt_trj.xyz FixedOpt.xyz; do
     if [ -f "$ORCA_RUN_DIR/$f" ]; then
@@ -165,35 +416,48 @@ for i in $(seq 1 $MAX_ITERATIONS); do
     fi
   done
 
-  # 将优化结果作为下一轮输入 orcaopt.xyz
-  if [ -f "$ORCA_RUN_DIR/FixedOpt.xyz" ]; then
-    cp -f "$ORCA_RUN_DIR/FixedOpt.xyz" ./orcaopt.xyz
-    echo "已更新下一轮输入: ./orcaopt.xyz"
+  SAVED_OPT_XYZ="$ORCA_SAVE_DIR/${ITER_TAG}_FixedOpt.xyz"
+  if [ -f "$SAVED_OPT_XYZ" ]; then
+    cat "$SAVED_OPT_XYZ" >> "$SCAN_TRAJ"
+    echo "Appended trajectory frame: $SAVED_OPT_XYZ -> $SCAN_TRAJ"
   else
-    echo "警告: 未找到 ORCA 优化结果 FixedOpt.xyz，保留上一轮 orcaopt.xyz"
+    echo "Warning: $SAVED_OPT_XYZ not found, skipping trajectory append for this iteration"
   fi
 
-  # --- 步骤 C: 记录能量 ---
-  echo "[步骤 C] 记录能量..."
+  if [ -f "$ORCA_RUN_DIR/FixedOpt.xyz" ]; then
+    cp -f "$ORCA_RUN_DIR/FixedOpt.xyz" ./orcaopt.xyz
+    echo "Updated next-iteration input: ./orcaopt.xyz"
+  else
+    echo "Warning: ORCA optimized geometry FixedOpt.xyz not found, keeping previous orcaopt.xyz"
+  fi
+
+  # C) Record energy
+  echo "[Step C] Recording energy..."
   if [ -f "$ORCA_RUN_DIR/FixedOpt.xyz" ]; then
     ENERGY_VALUE=$(sed -n '2p' "$ORCA_RUN_DIR/FixedOpt.xyz" | awk '{print $NF}')
     [ -z "$ENERGY_VALUE" ] && ENERGY_VALUE=NA
   else
     ENERGY_VALUE=NA
   fi
-  echo "$i,$ENERGY_VALUE" >> "$ENERGY_LOG"
-  echo "第 $i 次迭代能量: $ENERGY_VALUE Eh"
+
+  if [ "$ENERGY_VALUE" != "NA" ] && [ -n "$REF_ENERGY" ]; then
+    REL_ENERGY=$(awk -v e="$ENERGY_VALUE" -v ref="$REF_ENERGY" -v fac="$REL_FACTOR" 'BEGIN {printf "%.6f", (e-ref)*fac}')
+  else
+    REL_ENERGY=NA
+  fi
+  echo "$i,$ENERGY_VALUE,$REL_ENERGY" >> "$ENERGY_LOG"
+  echo "Iteration $i energy: $ENERGY_VALUE Eh, relative energy: $REL_ENERGY kcal/mol"
   echo
 done
 
-# --- 3. 结束 ---
-echo "------------------ 工作流执行完毕 ------------------"
-if [ -f orcaopt.xyz ]; then
-  cp -f orcaopt.xyz final_optimized.xyz
-  echo "最终优化结构已保存为: $WORKSPACE_DIR/final_optimized.xyz"
+# ---------------- 3. Finish ----------------
+echo "------------------ Workflow completed ------------------"
+if [ -f ./orcaopt.xyz ]; then
+  cp -f ./orcaopt.xyz ./final_optimized.xyz
+  echo "Final optimized geometry saved to: $WORKSPACE_DIR/final_optimized.xyz"
 else
-  echo "警告: 未找到 orcaopt.xyz，无法导出最终结构"
+  echo "Warning: orcaopt.xyz not found, final geometry export skipped"
 fi
-echo "能量记录保存在: $WORKSPACE_DIR/energy_log.csv"
+echo "Energy log saved to: $WORKSPACE_DIR/energy_log.csv"
+echo "Trajectory file saved to: $WORKSPACE_DIR/scan-traj.xyz"
 echo "================================================="
-

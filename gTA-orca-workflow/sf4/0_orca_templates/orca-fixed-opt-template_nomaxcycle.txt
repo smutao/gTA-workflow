@@ -1,4 +1,4 @@
-! Opt LooseOpt   B3LYP def2-SVP RIJCOSX def2/J TightSCF miniprint pal4
+! Opt LooseOpt   B3LYP def2-SVP RIJCOSX def2/J TightSCF miniprint 
 %geom Constraints
         FIXED_ATOM_LINES
         end

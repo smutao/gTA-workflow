@@ -1,0 +1,7 @@
+!   B3LYP def2-SVP RIJCOSX def2/J TightSCF miniprint 
+
+* xyz CHAR MULT
+XYZ_LINES
+*
+ 
+
