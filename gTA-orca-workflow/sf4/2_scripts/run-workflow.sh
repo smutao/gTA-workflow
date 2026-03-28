@@ -116,7 +116,7 @@ ORCA_TEMPLATE_NOMAX="$PROJECT_ROOT/0_orca_templates/orca-fixed-opt-template_noma
 ORCA_TEMPLATE_MAX="$PROJECT_ROOT/0_orca_templates/orca-fixed-opt-template_maxcycle.txt"
 ORCA_OPT_TEMPLATE="$ORCA_TEMPLATE_NOMAX"
 WORKSPACE_DIR="$PROJECT_ROOT/4_workspace"
-ORCA_PATH="singularity exec  -B /mnt/hdd_1t:/mnt/hdd_1t /home/raymond/storage-hdd-1tb/apptainer-images/orca.sif  orca"
+ORCA_PATH="/path/to/orca"
 
 # ---------------- Argument parsing ----------------
 while getopts ":m:a:c:r:q:u:f:i:n:k:h" opt; do
