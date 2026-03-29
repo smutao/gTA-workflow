@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.optimize import minimize
 #import matplotlib.pyplot as plt
-from rdkit import Chem
+#from rdkit import Chem
 from math import pi ,sin, cos, sqrt
 
 def point2molecule(central_point, sphere_points, filename, circle_center = None):

@@ -1,5 +1,5 @@
 $fix
-   atoms: 2-7
+   atoms: FIXED_ATOMS_1BASED
 $end
 $opt
     engine=inertial
